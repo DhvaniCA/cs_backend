@@ -28,7 +28,7 @@ router = APIRouter()
 RAZORPAY_BASE = "https://api.razorpay.com/v1"
 
 # CS exam levels used for order receipts
-CS_LEVELS = {"Foundation", "Executive", "Professional"}
+CS_LEVELS = {"CSEET", "Executive", "Professional"}
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ CS_LEVELS = {"Foundation", "Executive", "Professional"}
 class CreateOrderRequest(BaseModel):
     amount:   int           # in paise  e.g. 49900 → ₹499
     currency: str = "INR"
-    plan:     str           # "Foundation" | "Executive" | "Professional"
+    plan:     str           # "CSEET" | "Executive" | "Professional"
 
 
 class CreateOrderResponse(BaseModel):
