@@ -139,7 +139,7 @@ class UserCreate(BaseModel):
     password:   str
     name:       str
     phone:      str
-    cs_level:   str                    # Foundation | Executive | Professional
+    cs_level:   str                    # CSEET | Executive | Professional
     cs_attempt: str
     role:       str = "student"
     plan:       Optional[str] = "free"
@@ -607,7 +607,7 @@ async def is_cs_related_question(question: str) -> bool:
         "Answer YES if the question relates to:\n"
         "- ICSI syllabus, Company Law, Securities Law, Insolvency Law, FEMA,\n"
         "  Direct Tax, Indirect Tax/GST, Secretarial Practice, General Law,\n"
-        "  Corporate Governance, CS exams (Foundation / Executive / Professional),\n"
+        "  Corporate Governance, CS exams (CSEET / Executive / Professional),\n"
         "  or basic commerce/legal concepts studied by CS students.\n"
         "- The CS Tutor app, its features, team, or anything about this platform.\n\n"
         "Answer NO only if it is clearly unrelated (pure science, coding, sports, entertainment).\n\n"
@@ -630,9 +630,9 @@ async def is_cs_related_question(question: str) -> bool:
 def build_personalized_layer(user: dict) -> str:
     """Build a personalisation block from the user's CS profile."""
     name  = user.get("name", "Student").split()[0]
-    level = user.get("cs_level", "Foundation")
+    level = user.get("cs_level", "CSEET")
     guidance = {
-        "Foundation":    "Explain in simple language with basic concepts and easy examples. Focus on fundamentals.",
+        "CSEET":    "Explain in simple language with basic concepts and easy examples. Focus on fundamentals.",
         "Executive":     "Explain with clarity and practical understanding. Include relevant sections and examples.",
         "Professional":  "Provide detailed, professional-level explanation. Reference Acts, Rules, Case Laws and ICSI exam perspective.",
     }
@@ -642,7 +642,7 @@ def build_personalized_layer(user: dict) -> str:
         f"- CS Level: {level}\n\n"
         f"INSTRUCTIONS:\n"
         f"- Occasionally address the student as {name}\n"
-        f"- Teaching style: {guidance.get(level, guidance['Foundation'])}\n"
+        f"- Teaching style: {guidance.get(level, guidance['CSEET'])}\n"
         f"- Keep tone supportive, professional, and exam-focused\n"
         f"- Simplify complex legal language where necessary without losing accuracy."
     )
@@ -662,7 +662,7 @@ router = APIRouter(prefix="/admin/materials")
 @router.post("/upload_enhanced", response_model=UploadResponse)
 async def upload_pdf_enhanced(
     file:    UploadFile        = File(...),
-    course:  str               = Form(...),   # Foundation | Executive | Professional
+    course:  str               = Form(...),   # CSEET | Executive | Professional
     subject: Optional[str]     = Form(None),
     module:  Optional[str]     = Form(None),
     chapter: Optional[str]     = Form(None),
@@ -969,7 +969,7 @@ async def signup(user: UserCreate):
         "password_hash":       hash_password(user.password),
         "name":                user.name,
         "phone":               user.phone,
-        "cs_level":            user.cs_level,       # Foundation | Executive | Professional
+        "cs_level":            user.cs_level,       # CSEET | Executive | Professional
         "cs_attempt":          user.cs_attempt,
         "role":                "student",
         "status":              "approved",
@@ -1041,7 +1041,7 @@ async def register(user: UserCreate):
 @app.post("/auth/login", response_model=Token)
 async def login(data: UserLogin):
     user = await get_user_by_email(data.email)
-    if not user or user.get("status") not in ("approved", None):
+    if not user or user.get("status") != "approved":
         raise HTTPException(status_code=403, detail="Your account is pending admin approval.")
     # Support both password_hash (new) and password (legacy) field names
     pw_hash = user.get("password_hash") or user.get("password", "")
@@ -1430,7 +1430,7 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                     "This assistant is designed for Indian CS (Company Secretary) students. "
                     "Please ask a question related to CS topics such as Company Law, Securities Law, "
                     "Insolvency & Bankruptcy Code, FEMA, Secretarial Practice, Direct Tax, GST, "
-                    "CS exams (Foundation / Executive / Professional), "
+                    "CS exams (CSEET / Executive / Professional), "
                     "or about this platform."
                 ),
                 sources=[],
@@ -1499,7 +1499,7 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                 memory_block
                 + personal_context + "\n\n"
                 "You are a senior Indian Company Secretary (CS) faculty with deep expertise "
-                "in ICSI exam preparation (Foundation, Executive, Professional).\n\n"
+                "in ICSI exam preparation (CSEET, Executive, Professional).\n\n"
 
                 "Language rule (MANDATORY):\n"
                 "- Reply strictly in the SAME language as the student's question "
@@ -1623,7 +1623,7 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                 memory_block
                 + personal_context + "\n\n"
                 "You are an expert Indian Company Secretary (CS) tutor preparing students "
-                "for ICSI exams (Foundation, Executive, Professional).\n\n"
+                "for ICSI exams (CSEET, Executive, Professional).\n\n"
 
                 "Language rule:\n"
                 "- Reply strictly in the SAME language as the student's question "
