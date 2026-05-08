@@ -151,7 +151,8 @@ async def validate_config():
     print(f"[startup] LLM_MODEL       = {settings.LLM_MODEL}")
     print(f"[startup] EMBEDDING_MODEL = {settings.EMBEDDING_MODEL}")
     print(f"[startup] Gemini summary  = {'enabled' if gemini_key else 'disabled (set GEMINI_API_KEY to enable)'}")
-
+    worker_id = os.getpid()
+    print(f"[startup] Worker PID = {worker_id}")
 
 # ============================================================
 # PYDANTIC MODELS
