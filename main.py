@@ -4,6 +4,7 @@ import os
 import unicodedata
 import asyncio
 import time
+import shutil
 from datetime import datetime, timedelta
 from typing import Any, List, Optional, Dict
 import re
@@ -20,9 +21,11 @@ from fastapi import (
     Header,
     Form,
     APIRouter,
+    BackgroundTasks,
+    Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from jose import jwt, JWTError
@@ -63,6 +66,26 @@ app.add_middleware(
     expose_headers     = ["*"],
 )
 
+
+# ============================================================
+# GLOBAL ERROR MIDDLEWARE  —  exposes real crash in logs
+# ============================================================
+
+@app.middleware("http")
+async def catch_exceptions_middleware(request: Request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        print("GLOBAL SERVER ERROR:", str(e))
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Internal server error: {str(e)}"},
+        )
+
+
+# ── Routers must be included AFTER middleware ────────────────────────────────
 app.include_router(payment_router, prefix="/payments", tags=["payments"])
 
 CHAT_URL  = "https://api.openai.com/v1/chat/completions"
@@ -84,13 +107,13 @@ pwd_context = CryptContext(
 )
 
 mongo_client         = AsyncIOMotorClient(settings.MONGO_URI)
-db                   = mongo_client[settings.MONGO_DB]          # e.g. "cs-vector-db-index"
+db                   = mongo_client[settings.MONGO_DB]
 users_collection     = db["users"]
 docs_collection      = db["documents"]
-dashboard_collection = db["cs_dashboard"]                        # CS-specific collection
+dashboard_collection = db["cs_dashboard"]
 
 pinecone_client = pinecone.Pinecone(api_key=settings.PINECONE_API_KEY)
-index           = pinecone_client.Index(settings.PINECONE_INDEX)  # separate CS Pinecone index
+index           = pinecone_client.Index(settings.PINECONE_INDEX)
 
 JWT_EXP_MINUTES           = 60 * 24
 EMBED_BATCH_SIZE          = getattr(settings, "EMBED_BATCH_SIZE",          12)
@@ -173,11 +196,11 @@ class ChatRequest(BaseModel):
     mode:    Optional[str] = "qa"   # "qa" | "discussion"
 
 class UploadResponse(BaseModel):
-    success:    bool
-    message:    str
-    filename:   str
-    statistics: dict
-    metadata:   dict
+    success:            bool
+    message:            str
+    filename:           str
+    storage_backend:    str
+    processing_status:  str
 
 class ForgotPasswordRequest(BaseModel):
     email: str
@@ -243,6 +266,15 @@ def _save_local(content: bytes, safe_filename: str) -> str:
         f.write(content)
     base_url = getattr(settings, "BASE_URL", "")
     return f"{base_url}/uploads/{safe_filename}" if base_url else f"/uploads/{safe_filename}"
+
+
+def _save_local_from_path(src_path: str, safe_filename: str) -> str:
+    """Copy a file from src_path to UPLOAD_ROOT and return the URL path."""
+    dest_path = os.path.join(UPLOAD_ROOT, safe_filename)
+    shutil.copy(src_path, dest_path)
+    base_url = getattr(settings, "BASE_URL", "")
+    return f"{base_url}/uploads/{safe_filename}" if base_url else f"/uploads/{safe_filename}"
+
 
 def _safe_unlink(path: Optional[str]) -> None:
     if path:
@@ -411,18 +443,7 @@ async def call_gemini_flash(prompt: str) -> str:
 # CONVERSATION MEMORY  —  MongoDB helpers
 # ============================================================
 
-# Memory is stored directly on the user document (same pattern as CA platform)
-# This avoids a separate collection and keeps admin memory management simple.
-
 async def get_user_memory(user_email: str) -> Dict[str, Any]:
-    """
-    Fetch the sliding window of turns + rolling Gemini summary for a user.
-
-    Returns:
-        turns   - list of last MAX_TURNS Q+A pairs (each pair = 2 dicts)
-        summary - rolling Gemini summary string (empty for new users)
-        total   - lifetime turn counter (used to trigger summarisation)
-    """
     user = await users_collection.find_one(
         {"email": user_email},
         {"conversation_turns": 1, "conversation_summary": 1, "total_turns": 1},
@@ -442,20 +463,8 @@ async def save_turn_and_maybe_summarize(
     answer:         str,
     current_memory: Dict[str, Any],
 ) -> None:
-    """
-    Background task — runs AFTER the response is returned to the user.
-
-    Steps:
-    1. Append new Q+A pair to the sliding window, trim to MAX_TURNS pairs.
-    2. Every SUMMARIZE_EVERY turns, call Gemini Flash to update the
-       rolling summary. The new summary merges the old one with fresh turns
-       so context keeps growing without the token window growing.
-
-    Any exception is caught and logged — this task never crashes the server.
-    """
     now = datetime.utcnow().isoformat()
 
-    # Append new turn pair then trim to MAX_TURNS pairs (1 pair = 2 messages)
     new_turns = current_memory["turns"] + [
         {"role": "user",      "content": question, "ts": now},
         {"role": "assistant", "content": answer,   "ts": now},
@@ -468,7 +477,6 @@ async def save_turn_and_maybe_summarize(
         "total_turns":        new_total,
     }
 
-    # ── Trigger Gemini summarisation every SUMMARIZE_EVERY turns ─────────────
     if new_total % SUMMARIZE_EVERY == 0:
         turns_text = "\n".join(
             f"{t['role'].upper()}: {t['content'][:400]}"
@@ -509,10 +517,6 @@ async def save_turn_and_maybe_summarize(
 
 
 def build_memory_block(memory: Dict[str, Any]) -> str:
-    """
-    Format the rolling summary + recent turns into a single context block
-    prepended to every system prompt sent to the LLM.
-    """
     parts: List[str] = []
 
     if memory["summary"]:
@@ -523,12 +527,12 @@ def build_memory_block(memory: Dict[str, Any]) -> str:
         lines = []
         for t in recent_turns:
             role    = t.get("role", "user").upper()
-            content = t.get("content", "")[:500]   # cap per-turn chars to save tokens
+            content = t.get("content", "")[:500]
             lines.append(f"{role}: {content}")
         parts.append("RECENT CONVERSATION (last turns):\n" + "\n".join(lines))
 
     if not parts:
-        return ""   # new user — no memory block injected
+        return ""
 
     return (
         "=== STUDENT MEMORY ===\n"
@@ -542,7 +546,6 @@ def build_memory_block(memory: Dict[str, Any]) -> str:
 # ============================================================
 
 def enrich_query_for_rag(question: str) -> str:
-    """Append domain hints to short CS queries for better vector search recall."""
     q, hints = question.lower(), []
     if any(w in q for w in ["companies act", "director", "board", "agm", "egm", "nclt"]):
         hints.append("company law corporate governance")
@@ -564,7 +567,6 @@ def enrich_query_for_rag(question: str) -> str:
 
 
 def detect_subject(question: str) -> Optional[str]:
-    """Detect the CS subject from the question for Pinecone metadata filtering."""
     q = question.lower()
     if any(w in q for w in ["companies act", "director", "board", "agm", "egm", "nclt", "nclat",
                               "moa", "aoa", "incorporation", "share capital"]):
@@ -589,11 +591,6 @@ def detect_subject(question: str) -> Optional[str]:
 
 
 async def is_cs_related_question(question: str) -> bool:
-    """
-    Gatekeeper: returns True if the question is relevant to CS exam preparation
-    or about the platform itself.
-    """
-    # Fast-path: always allow questions about the platform itself
     _platform_keywords = [
         "cs tutor", "this app", "this platform", "who made", "who built",
         "who created", "who started", "about this", "founder", "promoter",
@@ -620,7 +617,7 @@ async def is_cs_related_question(question: str) -> bool:
         ])
         return result.strip().upper().startswith("YES")
     except Exception:
-        return True   # fail open — better to answer than to block
+        return True
 
 
 # ============================================================
@@ -628,13 +625,12 @@ async def is_cs_related_question(question: str) -> bool:
 # ============================================================
 
 def build_personalized_layer(user: dict) -> str:
-    """Build a personalisation block from the user's CS profile."""
     name  = user.get("name", "Student").split()[0]
     level = user.get("cs_level", "CSEET")
     guidance = {
-        "CSEET":    "Explain in simple language with basic concepts and easy examples. Focus on fundamentals.",
-        "Executive":     "Explain with clarity and practical understanding. Include relevant sections and examples.",
-        "Professional":  "Provide detailed, professional-level explanation. Reference Acts, Rules, Case Laws and ICSI exam perspective.",
+        "CSEET":        "Explain in simple language with basic concepts and easy examples. Focus on fundamentals.",
+        "Executive":    "Explain with clarity and practical understanding. Include relevant sections and examples.",
+        "Professional": "Provide detailed, professional-level explanation. Reference Acts, Rules, Case Laws and ICSI exam perspective.",
     }
     return (
         f"PERSONALISATION CONTEXT:\n"
@@ -655,14 +651,112 @@ def build_personalized_layer(user: dict) -> str:
 router = APIRouter(prefix="/admin/materials")
 
 
-# ----------------------------------------------------------
-# UPLOAD  ->  S3 (or local)  +  Pinecone  +  MongoDB
-# ----------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# BACKGROUND PROCESSING FUNCTION
+# Runs AFTER the upload route returns 200 to the client.
+# Handles: PDF parsing → embeddings → Pinecone → MongoDB records.
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def process_pdf_background(
+    temp_file_path:            str,
+    file_name:                 str,
+    extra_meta:                dict,
+    enable_image_descriptions: bool,
+    admin_email:               str,
+    course:                    str,
+    resolved_subject:          str,
+    resolved_module:           str,
+    resolved_chapter:          str,
+    resolved_unit:             str,
+    section:                   str,
+    custom_heading:            str,
+    pdf_url:                   str,
+    storage_backend:           str,
+    safe_filename:             str,
+):
+    try:
+        print(f"[BACKGROUND] Processing started: {file_name}")
+
+        result = await process_pdf_enhanced(
+            file_path                 = temp_file_path,
+            file_name                 = file_name,
+            extra_meta                = extra_meta,
+            enable_image_descriptions = enable_image_descriptions,
+            openai_api_key            = settings.OPENAI_API_KEY,
+        )
+
+        now = datetime.utcnow()
+
+        doc_record = {
+            "filename":        file_name,
+            "safe_filename":   safe_filename,
+            "course":          course,
+            "level":           course,
+            "subject":         resolved_subject,
+            "chapter":         resolved_chapter,
+            "section":         section or "",
+            "unit":            resolved_unit,
+            "module":          resolved_module,
+            "custom_heading":  custom_heading or "",
+            "pdf_url":         pdf_url or "",
+            "storage_backend": storage_backend,
+            "uploaded_by":     admin_email,
+            "uploaded_at":     now,
+            "total_vectors":   result["total_vectors"],
+            "platform":        "cs_tutor",
+            "processing_status": "completed",
+        }
+
+        inserted = await docs_collection.insert_one(doc_record)
+
+        await dashboard_collection.insert_one({
+            "level":              course,
+            "subject":            resolved_subject,
+            "module":             resolved_module,
+            "chapter":            resolved_chapter if resolved_chapter else file_name.replace(".pdf", ""),
+            "unit":               resolved_unit,
+            "title":              file_name.replace(".pdf", "").replace("_", " "),
+            "pdf_url":            pdf_url,
+            "video_url":          None,
+            "audio_url":          None,
+            "simplified_pdf_url": None,
+            "processing_status":  "completed",
+            "source_doc":         str(inserted.inserted_id),
+            "uploaded_by":        admin_email,
+            "created_at":         now,
+            "platform":           "cs_tutor",
+        })
+
+        print(f"[BACKGROUND] Processing completed: {file_name}  |  vectors={result['total_vectors']}")
+
+    except Exception as e:
+        print(f"[BACKGROUND ERROR] {file_name}: {str(e)}")
+        traceback.print_exc()
+
+    finally:
+        # Always clean up the temp file regardless of success/failure
+        try:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+                print(f"[BACKGROUND] Temp file removed: {temp_file_path}")
+        except Exception:
+            pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UPLOAD ROUTE  —  Render-safe version
+#
+# Key fixes vs. original:
+#   1. Streams file to disk in 1 MB chunks  →  no RAM spike
+#   2. Returns 200 immediately              →  no request timeout / fake CORS error
+#   3. Heavy work runs in BackgroundTask    →  Render worker stays alive
+# ──────────────────────────────────────────────────────────────────────────────
 
 @router.post("/upload_enhanced", response_model=UploadResponse)
 async def upload_pdf_enhanced(
+    background_tasks: BackgroundTasks,
     file:    UploadFile        = File(...),
-    course:  str               = Form(...),   # CSEET | Executive | Professional
+    course:  str               = Form(...),
     subject: Optional[str]     = Form(None),
     module:  Optional[str]     = Form(None),
     chapter: Optional[str]     = Form(None),
@@ -675,11 +769,7 @@ async def upload_pdf_enhanced(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    temp_file_path: Optional[str] = None
-
     try:
-        content = await file.read()
-
         level            = course.strip()
         resolved_subject = (subject or chapter or "General").strip()
         resolved_module  = (module  or section or "General").strip()
@@ -687,31 +777,46 @@ async def upload_pdf_enhanced(
         resolved_unit    = (unit    or "").strip()
         safe_filename    = file.filename.replace(" ", "_")
 
+        # ── STEP 1: Stream file to disk in 1 MB chunks — NO full RAM load ────
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+
+        while True:
+            chunk = await file.read(1024 * 1024)   # 1 MB at a time
+            if not chunk:
+                break
+            temp_file.write(chunk)
+
+        temp_file.close()
+        temp_file_path = temp_file.name
+        print(f"[UPLOAD] File streamed to disk: {temp_file_path}  ({safe_filename})")
+
+        # ── STEP 2: Upload to storage (S3 or local) ───────────────────────────
         s3_ready = is_s3_configured()
-        print(f"[upload] S3 configured={s3_ready}  file={safe_filename}")
+        print(f"[UPLOAD] S3 configured={s3_ready}  file={safe_filename}")
 
         if s3_ready:
             try:
+                # Read once for S3 upload — this is a one-time read, not the whole-request read
+                with open(temp_file_path, "rb") as f:
+                    pdf_bytes = f.read()
+
                 pdf_url         = upload_pdf_to_s3(
-                    file_bytes = content,
+                    file_bytes = pdf_bytes,
                     filename   = safe_filename,
                     level      = level,
                     subject    = resolved_subject,
                 )
                 storage_backend = "s3"
-                print(f"[upload] S3 upload OK -> {pdf_url}")
-            except RuntimeError as s3_err:
-                print(f"[upload] S3 failed, falling back to local: {s3_err}")
-                pdf_url         = _save_local(content, safe_filename)
-                storage_backend = f"local_fallback (s3_error: {s3_err})"
-        else:
-            pdf_url         = _save_local(content, safe_filename)
-            storage_backend = "local"
-            print(f"[upload] S3 not configured — stored locally: {pdf_url}")
+                print(f"[UPLOAD] S3 upload OK -> {pdf_url}")
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(content)
-            temp_file_path = tmp.name
+            except Exception as s3_err:
+                print(f"[UPLOAD] S3 failed, falling back to local: {s3_err}")
+                pdf_url         = _save_local_from_path(temp_file_path, safe_filename)
+                storage_backend = "local_fallback"
+        else:
+            pdf_url         = _save_local_from_path(temp_file_path, safe_filename)
+            storage_backend = "local"
+            print(f"[UPLOAD] S3 not configured — stored locally: {pdf_url}")
 
         now = datetime.utcnow()
 
@@ -728,80 +833,41 @@ async def upload_pdf_enhanced(
             "uploaded_by":    admin["email"],
             "uploaded_at":    now.isoformat(),
             "pdf_url":        pdf_url        or "",
-            "platform":       "cs_tutor",    # CS tag in Pinecone metadata
+            "platform":       "cs_tutor",
         }
 
-        result = await process_pdf_enhanced(
-            file_path                 = temp_file_path,
-            file_name                 = file.filename,
-            extra_meta                = extra_meta,
-            enable_image_descriptions = enable_image_descriptions,
-            openai_api_key            = settings.OPENAI_API_KEY,
+        # ── STEP 3: Kick off background processing and return immediately ─────
+        background_tasks.add_task(
+            process_pdf_background,
+            temp_file_path,
+            file.filename,
+            extra_meta,
+            enable_image_descriptions,
+            admin["email"],
+            course,
+            resolved_subject,
+            resolved_module,
+            resolved_chapter,
+            resolved_unit,
+            section or "",
+            custom_heading or "",
+            pdf_url,
+            storage_backend,
+            safe_filename,
         )
 
-        doc_record = {
-            "filename":        file.filename,
-            "safe_filename":   safe_filename,
-            "course":          course,
-            "level":           level,
-            "subject":         resolved_subject,
-            "chapter":         resolved_chapter,
-            "section":         section        or "",
-            "unit":            resolved_unit,
-            "module":          resolved_module,
-            "custom_heading":  custom_heading or "",
-            "pdf_url":         pdf_url        or "",
-            "storage_backend": storage_backend,
-            "uploaded_by":     admin["email"],
-            "uploaded_at":     now,
-            "total_vectors":   result["total_vectors"],
-            "platform":        "cs_tutor",
-        }
-        inserted   = await docs_collection.insert_one(doc_record)
-        doc_id_str = str(inserted.inserted_id)
-
-        await dashboard_collection.insert_one({
-            "level":              level            if level             else "Others",
-            "subject":            resolved_subject,
-            "module":             resolved_module  if resolved_module   else resolved_subject,
-            "chapter":            resolved_chapter if resolved_chapter  else file.filename.replace(".pdf", ""),
-            "unit":               resolved_unit,
-            "title":              file.filename.replace(".pdf", "").replace("_", " "),
-            "pdf_url":            pdf_url          or "",
-            # AI-generated content URLs — null on creation, populated by processing service
-            "video_url":          None,
-            "audio_url":          None,
-            "simplified_pdf_url": None,
-            "processing_status":  None,
-            "source_doc":         doc_id_str,
-            "uploaded_by":        admin["email"],
-            "created_at":         now,
-            "platform":           "cs_tutor",
-        })
-
-        _safe_unlink(temp_file_path)
-
         return UploadResponse(
-            success    = True,
-            message    = f"Successfully processed '{file.filename}' (storage: {storage_backend})",
-            filename   = file.filename,
-            statistics = {
-                "total_vectors":      result["total_vectors"],
-                "text_chunks":        result["text_chunks"],
-                "table_chunks":       result["table_chunks"],
-                "image_chunks":       result["image_chunks"],
-                "total_images_found": result["total_images"],
-                "total_tables_found": result["total_tables"],
-                "storage_backend":    storage_backend,
-            },
-            metadata = extra_meta,
+            success           = True,
+            message           = f"'{file.filename}' uploaded successfully. Processing started in background.",
+            filename          = file.filename,
+            storage_backend   = storage_backend,
+            processing_status = "started",
         )
 
     except Exception as e:
-        _safe_unlink(temp_file_path)
-        print(f"[upload_pdf_enhanced] Error — {file.filename}: {e}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
+        print(f"[UPLOAD ERROR] {file.filename}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
 # ----------------------------------------------------------
@@ -921,6 +987,7 @@ async def upload_service_health():
             "pinecone_delete":      True,
             "conversation_memory":  True,
             "gemini_summarisation": bool(getattr(settings, "GEMINI_API_KEY", "")),
+            "background_processing": True,
         },
     }
 
@@ -945,6 +1012,7 @@ async def upload_service_health():
     return health
 
 
+# ── Router must be included AFTER all routes are defined ─────────────────────
 app.include_router(router)
 
 
@@ -969,7 +1037,7 @@ async def signup(user: UserCreate):
         "password_hash":       hash_password(user.password),
         "name":                user.name,
         "phone":               user.phone,
-        "cs_level":            user.cs_level,       # CSEET | Executive | Professional
+        "cs_level":            user.cs_level,
         "cs_attempt":          user.cs_attempt,
         "role":                "student",
         "status":              "approved",
@@ -982,7 +1050,6 @@ async def signup(user: UserCreate):
             if plan == "paid" else None
         ),
         "created_at": now,
-        # Memory fields — initialised empty for all new users
         "conversation_turns":   [],
         "conversation_summary": "",
         "total_turns":          0,
@@ -998,7 +1065,6 @@ async def signup(user: UserCreate):
     return {"message": "Signup successful."}
 
 
-# Keep /auth/register as an alias for backwards compatibility
 @app.post("/auth/register", response_model=Token)
 async def register(user: UserCreate):
     if await get_user_by_email(user.email):
@@ -1043,7 +1109,6 @@ async def login(data: UserLogin):
     user = await get_user_by_email(data.email)
     if not user or user.get("status") != "approved":
         raise HTTPException(status_code=403, detail="Your account is pending admin approval.")
-    # Support both password_hash (new) and password (legacy) field names
     pw_hash = user.get("password_hash") or user.get("password", "")
     if not verify_password(data.password, pw_hash):
         raise HTTPException(status_code=400, detail="Invalid credentials")
@@ -1069,7 +1134,7 @@ async def forgot_password(body: ForgotPasswordRequest):
     user = await get_user_by_email(body.email)
     if not user:
         return {"message": "If this email is registered, an OTP has been sent."}
-    otp        = str(secrets.randbelow(900000) + 100000)   # 6-digit OTP
+    otp        = str(secrets.randbelow(900000) + 100000)
     expires_at = datetime.utcnow() + timedelta(minutes=10)
     await users_collection.update_one(
         {"email": body.email},
@@ -1131,7 +1196,6 @@ async def get_all_students(admin=Depends(get_current_admin)):
     students = []
     async for user in users_collection.find({"role": "student"}):
         user["_id"] = str(user["_id"])
-        # Remove sensitive fields before returning
         user.pop("password_hash", None)
         user.pop("password", None)
         user.pop("reset_otp", None)
@@ -1161,11 +1225,6 @@ async def reject_student(user_id: str, admin=Depends(get_current_admin)):
 
 @app.get("/admin/students/{user_id}/memory")
 async def get_student_memory(user_id: str, admin=Depends(get_current_admin)):
-    """
-    View a student's current conversation memory.
-    Shows turns, Gemini summary, and total turn count.
-    Useful for support, monitoring, and understanding student learning patterns.
-    """
     try:
         obj_id = ObjectId(user_id)
     except Exception:
@@ -1188,11 +1247,6 @@ async def get_student_memory(user_id: str, admin=Depends(get_current_admin)):
 
 @app.delete("/admin/students/{user_id}/memory")
 async def clear_student_memory(user_id: str, admin=Depends(get_current_admin)):
-    """
-    Clear a student's conversation memory (turns + summary).
-    The account and all other data are untouched.
-    Useful for support/debugging or at the student's own request.
-    """
     try:
         obj_id = ObjectId(user_id)
     except Exception:
@@ -1217,12 +1271,11 @@ async def clear_student_memory(user_id: str, admin=Depends(get_current_admin)):
 
 @app.get("/admin/documents", tags=["Admin"])
 async def list_documents(admin=Depends(get_current_admin)):
-    """All uploaded documents as a flat list."""
     docs = []
     async for doc in docs_collection.find(
         {},
         {"_id": 1, "filename": 1, "level": 1, "subject": 1,
-         "uploaded_at": 1, "total_vectors": 1, "pdf_url": 1}
+         "uploaded_at": 1, "total_vectors": 1, "pdf_url": 1, "processing_status": 1}
     ):
         doc["_id"] = str(doc["_id"])
         docs.append(doc)
@@ -1231,7 +1284,6 @@ async def list_documents(admin=Depends(get_current_admin)):
 
 @app.get("/admin/documents/grouped", tags=["Admin Materials"])
 async def get_grouped_documents(admin=Depends(get_current_admin)):
-    """All uploaded documents grouped by course/level, newest first."""
     grouped: Dict[str, List[Any]] = {}
     async for doc in docs_collection.find().sort("uploaded_at", -1):
         doc["_id"] = str(doc["_id"])
@@ -1249,7 +1301,6 @@ async def get_grouped_documents(admin=Depends(get_current_admin)):
 
 @app.get("/dashboard/tree")
 async def get_dashboard_tree(user=Depends(get_current_user)):
-    """4-level tree: level -> subject -> module -> chapter -> [items]"""
     tree: Dict[str, Any] = {}
     async for doc in dashboard_collection.find().sort("created_at", 1):
         doc["_id"] = str(doc["_id"])
@@ -1267,13 +1318,11 @@ async def get_dashboard_tree(user=Depends(get_current_user)):
             "_id":                doc["_id"],
             "title":              doc.get("title",              ""),
             "pdf_url":            doc.get("pdf_url",            ""),
-            # AI-generated content URLs (written by video processing service)
             "video_url":          doc.get("video_url")          or None,
             "audio_url":          doc.get("audio_url")          or None,
             "simplified_pdf_url": doc.get("simplified_pdf_url") or None,
-            # Status fields
             "processing_status":  doc.get("processing_status")  or None,
-            "status":             doc.get("processing_status")  or None,  # alias for frontend
+            "status":             doc.get("processing_status")  or None,
             "chapter":            chapter,
             "unit":               doc.get("unit", ""),
         })
@@ -1282,10 +1331,6 @@ async def get_dashboard_tree(user=Depends(get_current_user)):
 
 @app.get("/dashboard", tags=["Dashboard"])
 async def get_dashboard(user=Depends(get_current_user)):
-    """
-    Return CS study materials grouped by level → subject → module.
-    Filtered to the student's own CS level.
-    """
     cs_level = user.get("cs_level", "")
     query: dict = {}
     if cs_level:
@@ -1347,16 +1392,11 @@ async def add_dashboard_resource(
 
 
 # ============================================================
-# PDF PROXY — serves S3 PDFs inline (bypasses Content-Disposition: attachment)
+# PDF PROXY — serves S3 PDFs inline
 # ============================================================
 
 @app.get("/dashboard/pdf-proxy")
 async def pdf_proxy(url: str, user=Depends(get_current_user)):
-    """
-    Fetches a PDF from any S3/HTTPS URL and re-serves it with
-    Content-Disposition: inline so the browser renders it instead of downloading.
-    Auth-protected — only logged-in users can use it.
-    """
     if not url.startswith("https://"):
         raise HTTPException(status_code=400, detail="Only HTTPS URLs are supported")
 
@@ -1383,11 +1423,6 @@ async def pdf_proxy(url: str, user=Depends(get_current_user)):
 
 @app.get("/dashboard/audio-proxy")
 async def audio_proxy(url: str, user=Depends(get_current_user)):
-    """
-    Fetches an audio file from S3 and re-serves it with Content-Disposition: attachment
-    so the browser triggers a file download with a clean filename.
-    Auth-protected — only logged-in users can download.
-    """
     if not url.startswith("https://"):
         raise HTTPException(status_code=400, detail="Only HTTPS URLs are supported")
 
@@ -1418,12 +1453,8 @@ async def audio_proxy(url: str, user=Depends(get_current_user)):
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(req: ChatRequest, user=Depends(get_current_user)):
     try:
-        # ── Step 0: Expand CS abbreviations ──────────────────────────────────
         req.message = expand_cs_abbreviations(req.message)
 
-        # --------------------------------------------------
-        # Step 1: CS gatekeeper
-        # --------------------------------------------------
         if not await is_cs_related_question(req.message):
             return ChatResponse(
                 answer=(
@@ -1436,15 +1467,9 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                 sources=[],
             )
 
-        # --------------------------------------------------
-        # Step 2: Load conversation memory (non-blocking read)
-        # --------------------------------------------------
         memory       = await get_user_memory(user["email"])
         memory_block = build_memory_block(memory)
 
-        # --------------------------------------------------
-        # Step 3: RAG — Pinecone vector search
-        # --------------------------------------------------
         query_embedding = await embed_single(
             enrich_query_for_rag(req.message)[:MAX_TEXT_LENGTH_FOR_EMBED]
         )
@@ -1456,7 +1481,6 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
             "include_metadata": True,
         }
 
-        # Filter by detected subject AND student's CS level for precision
         pinecone_filter: dict = {}
         cs_level = user.get("cs_level", "")
         if detected_subj:
@@ -1469,7 +1493,6 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
         res     = index.query(**q_kwargs)
         matches = res.get("matches") or []
 
-        # Fallback 1: retry without subject filter if too few results
         if len(matches) < 4 and detected_subj:
             fallback_filter = {"level": {"$eq": cs_level}} if cs_level else {}
             res     = index.query(
@@ -1478,12 +1501,10 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
             )
             matches = res.get("matches") or []
 
-        # Fallback 2: retry with no filter at all
         if len(matches) < 4:
             res     = index.query(vector=query_embedding, top_k=20, include_metadata=True)
             matches = res.get("matches") or []
 
-        # Sort by score + dynamic threshold
         matches = sorted(matches, key=lambda m: m.get("score", 0), reverse=True)
         q_len   = len(req.message.split())
         thr     = 0.35 if q_len <= 6 else 0.45 if q_len <= 15 else 0.52
@@ -1491,9 +1512,6 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
 
         personal_context = build_personalized_layer(user)
 
-        # --------------------------------------------------
-        # Step 4: NO RAG MATCHES -> LLM-only answer (with memory)
-        # --------------------------------------------------
         if not matches:
             system_prompt = (
                 memory_block
@@ -1534,7 +1552,6 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                 {"role": "user",   "content": req.message},
             ])
 
-            # Fire-and-forget — does NOT block the response to the user
             asyncio.create_task(
                 save_turn_and_maybe_summarize(user["email"], req.message, answer, memory)
             )
@@ -1547,9 +1564,6 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                 }],
             )
 
-        # --------------------------------------------------
-        # Step 5: Build RAG context string (hard token cap)
-        # --------------------------------------------------
         context_blocks: List[str] = []
         sources: List[dict]       = []
 
@@ -1575,7 +1589,6 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                 "type":       meta.get("type", "text"),
             })
 
-        # Hard cap: 12 000 chars for RAG chunks to leave room for memory + system prompt
         trimmed, total = [], 0
         for b in context_blocks:
             if total + len(b) > 12000:
@@ -1584,9 +1597,6 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
             total += len(b)
         context_str = "\n\n---\n\n".join(trimmed)
 
-        # --------------------------------------------------
-        # Step 6: Final answer — QA or Discussion (both include memory)
-        # --------------------------------------------------
         if req.mode == "discussion":
             sys_p = (
                 memory_block
@@ -1657,7 +1667,6 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
             final_system_prompt = sys_p,
         )
 
-        # Deduplicate sources
         seen: set                 = set()
         clean_sources: List[dict] = []
         for s in sources:
@@ -1666,16 +1675,12 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                 seen.add(key)
                 clean_sources.append(s)
 
-        # Fire-and-forget — save turn + maybe summarise, does NOT block response
         asyncio.create_task(
             save_turn_and_maybe_summarize(user["email"], req.message, answer, memory)
         )
 
         return ChatResponse(answer=answer, sources=clean_sources[:5])
 
-    # --------------------------------------------------
-    # Step 7: SAFE FALLBACK — never return a blank answer
-    # --------------------------------------------------
     except Exception as e:
         traceback.print_exc()
         try:
