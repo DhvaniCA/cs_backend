@@ -3,8 +3,8 @@ import io
 import os
 import unicodedata
 import asyncio
+import uuid
 import time
-import shutil
 from datetime import datetime, timedelta
 from typing import Any, List, Optional, Dict
 import re
@@ -22,7 +22,6 @@ from fastapi import (
     Form,
     APIRouter,
     BackgroundTasks,
-    Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -66,26 +65,6 @@ app.add_middleware(
     expose_headers     = ["*"],
 )
 
-
-# ============================================================
-# GLOBAL ERROR MIDDLEWARE  —  exposes real crash in logs
-# ============================================================
-
-@app.middleware("http")
-async def catch_exceptions_middleware(request: Request, call_next):
-    try:
-        response = await call_next(request)
-        return response
-    except Exception as e:
-        print("GLOBAL SERVER ERROR:", str(e))
-        traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"detail": f"Internal server error: {str(e)}"},
-        )
-
-
-# ── Routers must be included AFTER middleware ────────────────────────────────
 app.include_router(payment_router, prefix="/payments", tags=["payments"])
 
 CHAT_URL  = "https://api.openai.com/v1/chat/completions"
@@ -122,14 +101,21 @@ EMBED_MAX_RETRIES         = getattr(settings, "EMBED_MAX_RETRIES",         3)
 EMBED_BACKOFF_BASE        = getattr(settings, "EMBED_BACKOFF_BASE",        1.8)
 MAX_TEXT_LENGTH_FOR_EMBED = getattr(settings, "MAX_TEXT_LENGTH_FOR_EMBED", 8000)
 
-# Local uploads folder — fallback when S3 is not configured
-UPLOAD_ROOT = getattr(settings, "UPLOAD_ROOT", "./uploads")
+# Local uploads folder — safe for Render's ephemeral filesystem
+UPLOAD_ROOT = getattr(settings, "UPLOAD_ROOT", tempfile.gettempdir())
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
+_STATIC_DIR = getattr(settings, "UPLOAD_ROOT", None)
+if _STATIC_DIR and _STATIC_DIR not in ("/tmp", tempfile.gettempdir()):
+    app.mount("/uploads", StaticFiles(directory=_STATIC_DIR), name="uploads")
+
+# ── In-memory upload job store ────────────────────────────────────────────────
+# Shape: { job_id: { status, filename, started_at, finished_at, result, error } }
+# Lost on dyno restart — fine, since UI only polls immediately after upload.
+_upload_jobs: Dict[str, Dict[str, Any]] = {}
 
 # ── Conversation memory constants ─────────────────────────────────────────────
-MAX_TURNS       = 10   # Q+A pairs kept in the sliding window per user
-SUMMARIZE_EVERY = 5    # trigger Gemini summarisation every N new turns
+MAX_TURNS       = 10
+SUMMARIZE_EVERY = 5
 
 
 # ============================================================
@@ -151,8 +137,7 @@ async def validate_config():
     print(f"[startup] LLM_MODEL       = {settings.LLM_MODEL}")
     print(f"[startup] EMBEDDING_MODEL = {settings.EMBEDDING_MODEL}")
     print(f"[startup] Gemini summary  = {'enabled' if gemini_key else 'disabled (set GEMINI_API_KEY to enable)'}")
-    worker_id = os.getpid()
-    print(f"[startup] Worker PID = {worker_id}")
+
 
 # ============================================================
 # PYDANTIC MODELS
@@ -163,7 +148,7 @@ class UserCreate(BaseModel):
     password:   str
     name:       str
     phone:      str
-    cs_level:   str                    # CSEET | Executive | Professional
+    cs_level:   str
     cs_attempt: str
     role:       str = "student"
     plan:       Optional[str] = "free"
@@ -194,14 +179,14 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: Optional[List[ChatMessage]] = None
-    mode:    Optional[str] = "qa"   # "qa" | "discussion"
+    mode:    Optional[str] = "qa"
 
 class UploadResponse(BaseModel):
-    success:            bool
-    message:            str
-    filename:           str
-    storage_backend:    str
-    processing_status:  str
+    success:    bool
+    message:    str
+    filename:   str
+    statistics: dict
+    metadata:   dict
 
 class ForgotPasswordRequest(BaseModel):
     email: str
@@ -258,24 +243,14 @@ async def get_current_admin(user=Depends(get_current_user)):
 
 
 # ============================================================
-# HELPERS  (upload + chat shared)
+# HELPERS
 # ============================================================
 
 def _save_local(content: bytes, safe_filename: str) -> str:
-    """Write bytes to UPLOAD_ROOT and return the URL path."""
     with open(os.path.join(UPLOAD_ROOT, safe_filename), "wb") as f:
         f.write(content)
     base_url = getattr(settings, "BASE_URL", "")
     return f"{base_url}/uploads/{safe_filename}" if base_url else f"/uploads/{safe_filename}"
-
-
-def _save_local_from_path(src_path: str, safe_filename: str) -> str:
-    """Copy a file from src_path to UPLOAD_ROOT and return the URL path."""
-    dest_path = os.path.join(UPLOAD_ROOT, safe_filename)
-    shutil.copy(src_path, dest_path)
-    base_url = getattr(settings, "BASE_URL", "")
-    return f"{base_url}/uploads/{safe_filename}" if base_url else f"/uploads/{safe_filename}"
-
 
 def _safe_unlink(path: Optional[str]) -> None:
     if path:
@@ -287,7 +262,7 @@ def _safe_unlink(path: Optional[str]) -> None:
 
 
 # ============================================================
-# EMBEDDING + LLM  (OpenAI)
+# EMBEDDING + LLM
 # ============================================================
 
 async def embed_texts(texts: List[str]) -> List[List[float]]:
@@ -371,12 +346,6 @@ async def call_llm_with_chain(
     final_system_prompt: str,
     temperature:         float = 0.2,
 ) -> str:
-    """
-    Two-step chain:
-      1. Classify query type (DEFINITION | PROCEDURE | CASE_LAW | NUMERICAL | COMPARISON | GENERAL)
-      2. Generate final answer with query-type context injected into the system prompt.
-    Only the final answer is returned.
-    """
     classification_messages = [
         {
             "role":    "system",
@@ -410,10 +379,6 @@ async def call_llm_with_chain(
 # ============================================================
 
 async def call_gemini_flash(prompt: str) -> str:
-    """
-    Call Gemini 2.0 Flash for cheap rolling summarisation.
-    Returns empty string on any failure — summarisation is non-critical.
-    """
     gemini_key = getattr(settings, "GEMINI_API_KEY", "")
     if not gemini_key:
         return ""
@@ -441,7 +406,7 @@ async def call_gemini_flash(prompt: str) -> str:
 
 
 # ============================================================
-# CONVERSATION MEMORY  —  MongoDB helpers
+# CONVERSATION MEMORY
 # ============================================================
 
 async def get_user_memory(user_email: str) -> Dict[str, Any]:
@@ -543,7 +508,7 @@ def build_memory_block(memory: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# QUERY HELPERS  (used only by /chat)
+# QUERY HELPERS
 # ============================================================
 
 def enrich_query_for_rag(question: str) -> str:
@@ -646,229 +611,265 @@ def build_personalized_layer(user: dict) -> str:
 
 
 # ============================================================
-# ADMIN MATERIALS ROUTER
+# BACKGROUND UPLOAD PIPELINE
 # ============================================================
 
-router = APIRouter(prefix="/admin/materials")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# BACKGROUND PROCESSING FUNCTION
-# Runs AFTER the upload route returns 200 to the client.
-# Handles: PDF parsing → embeddings → Pinecone → MongoDB records.
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def process_pdf_background(
-    temp_file_path:            str,
-    file_name:                 str,
-    extra_meta:                dict,
-    enable_image_descriptions: bool,
-    admin_email:               str,
+async def _run_upload_pipeline(
+    job_id:                    str,
+    content:                   bytes,
+    filename:                  str,
+    safe_filename:             str,
     course:                    str,
+    level:                     str,
     resolved_subject:          str,
     resolved_module:           str,
     resolved_chapter:          str,
     resolved_unit:             str,
     section:                   str,
     custom_heading:            str,
-    pdf_url:                   str,
-    storage_backend:           str,
-    safe_filename:             str,
-):
-    try:
-        print(f"[BACKGROUND] Processing started: {file_name}")
+    admin_email:               str,
+    enable_image_descriptions: bool,
+) -> None:
+    """
+    Runs as a FastAPI BackgroundTask — outside the 30-second Render HTTP window.
+    Writes PDF to /tmp, calls Docling + Pinecone, inserts Mongo records,
+    and updates _upload_jobs[job_id] throughout.
+    """
+    temp_file_path: Optional[str] = None
 
+    try:
+        _upload_jobs[job_id]["status"] = "processing"
+
+        # Write bytes to /tmp
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(content)
+            temp_file_path = tmp.name
+
+        # S3 or local storage
+        s3_ready = is_s3_configured()
+        if s3_ready:
+            try:
+                pdf_url         = upload_pdf_to_s3(
+                    file_bytes = content,
+                    filename   = safe_filename,
+                    level      = level,
+                    subject    = resolved_subject,
+                )
+                storage_backend = "s3"
+                print(f"[upload] S3 upload OK -> {pdf_url}")
+            except RuntimeError as s3_err:
+                print(f"[upload] S3 failed, falling back to local: {s3_err}")
+                pdf_url         = _save_local(content, safe_filename)
+                storage_backend = f"local_fallback (s3_error: {s3_err})"
+        else:
+            pdf_url         = _save_local(content, safe_filename)
+            storage_backend = "local"
+            print(f"[upload] S3 not configured — stored locally: {pdf_url}")
+
+        now = datetime.utcnow()
+
+        extra_meta = {
+            "title":          filename,
+            "course":         course,
+            "level":          level,
+            "subject":        resolved_subject,
+            "chapter":        resolved_chapter,
+            "section":        section,
+            "unit":           resolved_unit,
+            "module":         resolved_module,
+            "custom_heading": custom_heading,
+            "uploaded_by":    admin_email,
+            "uploaded_at":    now.isoformat(),
+            "pdf_url":        pdf_url or "",
+            "platform":       "cs_tutor",
+        }
+
+        # Docling + Pinecone ingestion (the slow part — safe here in background)
         result = await process_pdf_enhanced(
             file_path                 = temp_file_path,
-            file_name                 = file_name,
+            file_name                 = filename,
             extra_meta                = extra_meta,
             enable_image_descriptions = enable_image_descriptions,
             openai_api_key            = settings.OPENAI_API_KEY,
         )
 
-        now = datetime.utcnow()
-
+        # Mongo: documents collection
         doc_record = {
-            "filename":        file_name,
+            "filename":        filename,
             "safe_filename":   safe_filename,
             "course":          course,
-            "level":           course,
+            "level":           level,
             "subject":         resolved_subject,
             "chapter":         resolved_chapter,
-            "section":         section or "",
+            "section":         section,
             "unit":            resolved_unit,
             "module":          resolved_module,
-            "custom_heading":  custom_heading or "",
+            "custom_heading":  custom_heading,
             "pdf_url":         pdf_url or "",
             "storage_backend": storage_backend,
             "uploaded_by":     admin_email,
             "uploaded_at":     now,
             "total_vectors":   result["total_vectors"],
             "platform":        "cs_tutor",
-            "processing_status": "completed",
         }
+        inserted   = await docs_collection.insert_one(doc_record)
+        doc_id_str = str(inserted.inserted_id)
 
-        inserted = await docs_collection.insert_one(doc_record)
-
+        # Mongo: dashboard collection
         await dashboard_collection.insert_one({
-            "level":              course,
+            "level":              level or "Others",
             "subject":            resolved_subject,
-            "module":             resolved_module,
-            "chapter":            resolved_chapter if resolved_chapter else file_name.replace(".pdf", ""),
+            "module":             resolved_module or resolved_subject,
+            "chapter":            resolved_chapter or filename.replace(".pdf", ""),
             "unit":               resolved_unit,
-            "title":              file_name.replace(".pdf", "").replace("_", " "),
-            "pdf_url":            pdf_url,
+            "title":              filename.replace(".pdf", "").replace("_", " "),
+            "pdf_url":            pdf_url or "",
             "video_url":          None,
             "audio_url":          None,
             "simplified_pdf_url": None,
-            "processing_status":  "completed",
-            "source_doc":         str(inserted.inserted_id),
+            "processing_status":  None,
+            "source_doc":         doc_id_str,
             "uploaded_by":        admin_email,
             "created_at":         now,
             "platform":           "cs_tutor",
         })
 
-        print(f"[BACKGROUND] Processing completed: {file_name}  |  vectors={result['total_vectors']}")
+        _safe_unlink(temp_file_path)
+
+        # Mark job done
+        _upload_jobs[job_id].update({
+            "status":      "done",
+            "finished_at": datetime.utcnow().isoformat(),
+            "result": {
+                "success":    True,
+                "message":    f"Successfully processed '{filename}' (storage: {storage_backend})",
+                "filename":   filename,
+                "statistics": {
+                    "total_vectors":      result["total_vectors"],
+                    "text_chunks":        result["text_chunks"],
+                    "table_chunks":       result["table_chunks"],
+                    "image_chunks":       result["image_chunks"],
+                    "total_images_found": result["total_images"],
+                    "total_tables_found": result["total_tables"],
+                    "storage_backend":    storage_backend,
+                },
+                "metadata": extra_meta,
+            },
+            "error": None,
+        })
+        print(f"[upload] Job {job_id} done — {filename}")
 
     except Exception as e:
-        print(f"[BACKGROUND ERROR] {file_name}: {str(e)}")
+        _safe_unlink(temp_file_path)
         traceback.print_exc()
-
-    finally:
-        # Always clean up the temp file regardless of success/failure
-        try:
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-                print(f"[BACKGROUND] Temp file removed: {temp_file_path}")
-        except Exception:
-            pass
+        _upload_jobs[job_id].update({
+            "status":      "failed",
+            "finished_at": datetime.utcnow().isoformat(),
+            "result":      None,
+            "error":       str(e),
+        })
+        print(f"[upload] Job {job_id} FAILED — {filename}: {e}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# UPLOAD ROUTE  —  Render-safe version
-#
-# Key fixes vs. original:
-#   1. Streams file to disk in 1 MB chunks  →  no RAM spike
-#   2. Returns 200 immediately              →  no request timeout / fake CORS error
-#   3. Heavy work runs in BackgroundTask    →  Render worker stays alive
-# ──────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# ADMIN MATERIALS ROUTER
+# ============================================================
 
-@router.post("/upload_enhanced", response_model=UploadResponse)
+router = APIRouter(prefix="/admin/materials")
+
+
+# ----------------------------------------------------------
+# UPLOAD  — returns 202 immediately, processes in background
+# ----------------------------------------------------------
+
+@router.post("/upload_enhanced")
 async def upload_pdf_enhanced(
-    background_tasks: BackgroundTasks,
-    file:    UploadFile        = File(...),
-    course:  str               = Form(...),
-    subject: Optional[str]     = Form(None),
-    module:  Optional[str]     = Form(None),
-    chapter: Optional[str]     = Form(None),
-    unit:    Optional[str]     = Form(None),
-    section: Optional[str]     = Form(None),
-    custom_heading: Optional[str] = Form(None),
-    enable_image_descriptions: bool = Form(True),
+    background_tasks:          BackgroundTasks,
+    file:                      UploadFile        = File(...),
+    course:                    str               = Form(...),
+    subject:                   Optional[str]     = Form(None),
+    module:                    Optional[str]     = Form(None),
+    chapter:                   Optional[str]     = Form(None),
+    unit:                      Optional[str]     = Form(None),
+    section:                   Optional[str]     = Form(None),
+    custom_heading:            Optional[str]     = Form(None),
+    enable_image_descriptions: bool              = Form(True),
     admin = Depends(get_current_admin),
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    try:
-        level            = course.strip()
-        resolved_subject = (subject or chapter or "General").strip()
-        resolved_module  = (module  or section or "General").strip()
-        resolved_chapter = (chapter or "").strip()
-        resolved_unit    = (unit    or "").strip()
-        safe_filename    = file.filename.replace(" ", "_")
+    # Read file bytes synchronously — fast, no timeout risk
+    content = await file.read()
 
-        # ── STEP 1: Stream file to disk in 1 MB chunks — NO full RAM load ────
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    level            = course.strip()
+    resolved_subject = (subject or chapter or "General").strip()
+    resolved_module  = (module  or section or "General").strip()
+    resolved_chapter = (chapter or "").strip()
+    resolved_unit    = (unit    or "").strip()
+    safe_filename    = file.filename.replace(" ", "_")
 
-        while True:
-            chunk = await file.read(1024 * 1024)   # 1 MB at a time
-            if not chunk:
-                break
-            temp_file.write(chunk)
+    # Register job BEFORE launching background task
+    job_id = str(uuid.uuid4())
+    _upload_jobs[job_id] = {
+        "status":      "queued",
+        "filename":    file.filename,
+        "started_at":  datetime.utcnow().isoformat(),
+        "finished_at": None,
+        "result":      None,
+        "error":       None,
+    }
 
-        temp_file.close()
-        temp_file_path = temp_file.name
-        print(f"[UPLOAD] File streamed to disk: {temp_file_path}  ({safe_filename})")
+    # Hand off to background — response returns in <1 second
+    background_tasks.add_task(
+        _run_upload_pipeline,
+        job_id                    = job_id,
+        content                   = content,
+        filename                  = file.filename,
+        safe_filename             = safe_filename,
+        course                    = course,
+        level                     = level,
+        resolved_subject          = resolved_subject,
+        resolved_module           = resolved_module,
+        resolved_chapter          = resolved_chapter,
+        resolved_unit             = resolved_unit,
+        section                   = section or "",
+        custom_heading            = custom_heading or "",
+        admin_email               = admin["email"],
+        enable_image_descriptions = enable_image_descriptions,
+    )
 
-        # ── STEP 2: Upload to storage (S3 or local) ───────────────────────────
-        s3_ready = is_s3_configured()
-        print(f"[UPLOAD] S3 configured={s3_ready}  file={safe_filename}")
+    return JSONResponse(
+        status_code = 202,
+        content     = {
+            "job_id":   job_id,
+            "filename": file.filename,
+            "message":  "Upload queued — poll /admin/materials/upload_status/{job_id} for progress",
+        },
+    )
 
-        if s3_ready:
-            try:
-                # Read once for S3 upload — this is a one-time read, not the whole-request read
-                with open(temp_file_path, "rb") as f:
-                    pdf_bytes = f.read()
 
-                pdf_url         = upload_pdf_to_s3(
-                    file_bytes = pdf_bytes,
-                    filename   = safe_filename,
-                    level      = level,
-                    subject    = resolved_subject,
-                )
-                storage_backend = "s3"
-                print(f"[UPLOAD] S3 upload OK -> {pdf_url}")
+# ----------------------------------------------------------
+# POLL — single job status
+# ----------------------------------------------------------
 
-            except Exception as s3_err:
-                print(f"[UPLOAD] S3 failed, falling back to local: {s3_err}")
-                pdf_url         = _save_local_from_path(temp_file_path, safe_filename)
-                storage_backend = "local_fallback"
-        else:
-            pdf_url         = _save_local_from_path(temp_file_path, safe_filename)
-            storage_backend = "local"
-            print(f"[UPLOAD] S3 not configured — stored locally: {pdf_url}")
+@router.get("/upload_status/{job_id}", tags=["Admin Materials"])
+async def get_upload_status(job_id: str, admin=Depends(get_current_admin)):
+    job = _upload_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
-        now = datetime.utcnow()
 
-        extra_meta = {
-            "title":          file.filename,
-            "course":         course,
-            "level":          level,
-            "subject":        resolved_subject,
-            "chapter":        resolved_chapter,
-            "section":        section        or "",
-            "unit":           resolved_unit,
-            "module":         resolved_module,
-            "custom_heading": custom_heading or "",
-            "uploaded_by":    admin["email"],
-            "uploaded_at":    now.isoformat(),
-            "pdf_url":        pdf_url        or "",
-            "platform":       "cs_tutor",
-        }
+# ----------------------------------------------------------
+# POLL — list all recent jobs (newest first, capped at 50)
+# ----------------------------------------------------------
 
-        # ── STEP 3: Kick off background processing and return immediately ─────
-        background_tasks.add_task(
-            process_pdf_background,
-            temp_file_path,
-            file.filename,
-            extra_meta,
-            enable_image_descriptions,
-            admin["email"],
-            course,
-            resolved_subject,
-            resolved_module,
-            resolved_chapter,
-            resolved_unit,
-            section or "",
-            custom_heading or "",
-            pdf_url,
-            storage_backend,
-            safe_filename,
-        )
-
-        return UploadResponse(
-            success           = True,
-            message           = f"'{file.filename}' uploaded successfully. Processing started in background.",
-            filename          = file.filename,
-            storage_backend   = storage_backend,
-            processing_status = "started",
-        )
-
-    except Exception as e:
-        traceback.print_exc()
-        print(f"[UPLOAD ERROR] {file.filename}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+@router.get("/upload_status", tags=["Admin Materials"])
+async def list_upload_jobs(admin=Depends(get_current_admin)):
+    jobs = [{"job_id": jid, **jdata} for jid, jdata in _upload_jobs.items()]
+    jobs.sort(key=lambda j: j.get("started_at", ""), reverse=True)
+    return jobs[:50]
 
 
 # ----------------------------------------------------------
@@ -934,7 +935,6 @@ async def delete_document(doc_id: str, admin=Depends(get_current_admin)):
 
 
 async def _delete_pinecone_by_source(source_filename: str) -> int:
-    """Delete all Pinecone vectors whose metadata.source == source_filename."""
     try:
         index_info = index.describe_index_stats()
         dim = index_info.get("dimension", 3072)
@@ -987,8 +987,8 @@ async def upload_service_health():
             "enhanced_chunking":    True,
             "pinecone_delete":      True,
             "conversation_memory":  True,
+            "background_upload":    True,
             "gemini_summarisation": bool(getattr(settings, "GEMINI_API_KEY", "")),
-            "background_processing": True,
         },
     }
 
@@ -1013,7 +1013,6 @@ async def upload_service_health():
     return health
 
 
-# ── Router must be included AFTER all routes are defined ─────────────────────
 app.include_router(router)
 
 
@@ -1276,7 +1275,7 @@ async def list_documents(admin=Depends(get_current_admin)):
     async for doc in docs_collection.find(
         {},
         {"_id": 1, "filename": 1, "level": 1, "subject": 1,
-         "uploaded_at": 1, "total_vectors": 1, "pdf_url": 1, "processing_status": 1}
+         "uploaded_at": 1, "total_vectors": 1, "pdf_url": 1}
     ):
         doc["_id"] = str(doc["_id"])
         docs.append(doc)
@@ -1393,7 +1392,7 @@ async def add_dashboard_resource(
 
 
 # ============================================================
-# PDF PROXY — serves S3 PDFs inline
+# PDF / AUDIO PROXY
 # ============================================================
 
 @app.get("/dashboard/pdf-proxy")
