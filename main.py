@@ -1703,6 +1703,106 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
             )
 
 
+
+@router.post("/{dashboard_id}/upload_smart_pdf", tags=["Admin Materials"])
+async def upload_smart_pdf(
+    dashboard_id: str,
+    file: UploadFile = File(...),
+    admin=Depends(get_current_admin),
+):
+    """
+    Upload a Smart (simplified) PDF for a cs_dashboard item.
+
+    - Stores at: s3://bucket/cs-content/{dashboard_id}/simplified_pdf.pdf
+    - Updates cs_dashboard.simplified_pdf_url in MongoDB.
+    - Overwrites any previously uploaded Smart PDF for this item.
+
+    Returns: { dashboard_id, simplified_pdf_url, message }
+    """
+    filename = file.filename or ""
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted for Smart PDF upload.")
+
+    try:
+        obj_id = ObjectId(dashboard_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid dashboard_id format.")
+
+    doc = await dashboard_collection.find_one({"_id": obj_id})
+    if not doc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Dashboard document '{dashboard_id}' not found in cs_dashboard.",
+        )
+
+    file_bytes = await file.read()
+    if len(file_bytes) < 100:
+        raise HTTPException(status_code=400, detail="Uploaded file appears to be empty.")
+
+    import boto3
+    from botocore.exceptions import ClientError as _BotoClientError
+
+    # ← Only difference from CA: "cs-content/" instead of "ca-content/"
+    s3_key = f"cs-content/{dashboard_id}/simplified_pdf.pdf"
+
+    tmp_path = None
+    try:
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+            region_name=settings.AWS_REGION,
+        )
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        s3_client.upload_file(
+            tmp_path,
+            settings.S3_BUCKET_NAME,
+            s3_key,
+            ExtraArgs={"ACL": "public-read", "ContentType": "application/pdf"},
+        )
+        _safe_unlink(tmp_path)
+
+    except _BotoClientError as e:
+        _safe_unlink(tmp_path)
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
+    except Exception as e:
+        _safe_unlink(tmp_path)
+        raise HTTPException(status_code=500, detail=f"Upload error: {e}")
+
+    simplified_pdf_url = (
+        f"https://{settings.S3_BUCKET_NAME}"
+        f".s3.{settings.AWS_REGION}.amazonaws.com/{s3_key}"
+    )
+
+    result = await dashboard_collection.find_one_and_update(
+        {"_id": obj_id},
+        {"$set": {
+            "simplified_pdf_url": simplified_pdf_url,
+            "updated_at":         datetime.utcnow(),
+        }},
+        return_document=True,
+    )
+
+    if not result:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"File uploaded to S3 but failed to update MongoDB. "
+                f"Manual fix: set simplified_pdf_url = '{simplified_pdf_url}'"
+            ),
+        )
+
+    print(f"[SmartPDF] ✅ cs dashboard={dashboard_id} → {simplified_pdf_url}")
+
+    return {
+        "dashboard_id":       dashboard_id,
+        "simplified_pdf_url": simplified_pdf_url,
+        "message":            "Smart PDF uploaded and saved successfully.",
+    }
 # ============================================================
 # HEALTH
 # ============================================================
