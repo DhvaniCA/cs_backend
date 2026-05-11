@@ -1760,7 +1760,7 @@ async def upload_smart_pdf(
 
         s3_client.upload_file(
             tmp_path,
-            settings.S3_BUCKET_NAME,
+            settings.AWS_S3_BUCKET,
             s3_key,
             ExtraArgs={"ACL": "public-read", "ContentType": "application/pdf"},
         )
@@ -1774,7 +1774,7 @@ async def upload_smart_pdf(
         raise HTTPException(status_code=500, detail=f"Upload error: {e}")
 
     simplified_pdf_url = (
-        f"https://{settings.S3_BUCKET_NAME}"
+        f"https://{settings.AWS_S3_BUCKET}"
         f".s3.{settings.AWS_REGION}.amazonaws.com/{s3_key}"
     )
 
