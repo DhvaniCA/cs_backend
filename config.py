@@ -49,7 +49,6 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET:         Optional[str] = None
     # Set to "false" when your bucket has ACLs disabled (new AWS default).
     # When false, 7-day presigned URLs are generated instead.
-    S3_BUCKET_NAME:         str           = "true"
 
     # ── Optional tuning ───────────────────────────────────────────────────────
     EMBED_BATCH_SIZE:          int   = 12
