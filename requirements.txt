@@ -30,10 +30,11 @@ pytesseract>=0.3.10
 docling>=1.16.0
 
 # ── Config ─────────────────────────────────────────────────
-pydantic>=2.7
 pydantic-settings>=2.2
 python-dotenv>=1.0
-
+# Stable, widely tested, Python 3.11-3.14 support
+pydantic==2.11.10
+pydantic-core==2.33.2
 # ── Storage ────────────────────────────────────────────────
 boto3>=1.34
 
