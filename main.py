@@ -1817,6 +1817,7 @@
 # backend/main.py  —  CS Tutor Platform (Company Secretary)
 import io
 import os
+import base64
 import unicodedata
 import asyncio
 import uuid
@@ -1892,6 +1893,9 @@ GEMINI_URL = (
     "gemini-2.0-flash:generateContent"
 )
 
+# Vision model used for image text extraction
+VISION_MODEL = "gpt-4o"
+
 
 # ============================================================
 # DB + EXTERNAL CLIENTS
@@ -1931,12 +1935,6 @@ _upload_jobs: Dict[str, Dict[str, Any]] = {}
 MAX_TURNS       = 10
 SUMMARIZE_EVERY = 5
 
-# ── File-upload chat marker (sent by frontend) ────────────────────────────────
-_FILE_UPLOAD_MARKER = re.compile(
-    r"^\[(Image|Document) uploaded:\s*\"[^\"]*\"\]",
-    re.IGNORECASE,
-)
-
 
 # ============================================================
 # STARTUP VALIDATION
@@ -1956,6 +1954,7 @@ async def validate_config():
     print(f"[startup] Pinecone index  = {settings.PINECONE_INDEX}")
     print(f"[startup] LLM_MODEL       = {settings.LLM_MODEL}")
     print(f"[startup] EMBEDDING_MODEL = {settings.EMBEDDING_MODEL}")
+    print(f"[startup] Vision model    = {VISION_MODEL}")
     print(f"[startup] Gemini summary  = {'enabled' if gemini_key else 'disabled (set GEMINI_API_KEY to enable)'}")
 
 
@@ -1997,9 +1996,18 @@ class ChatMessage(BaseModel):
     content: str
 
 class ChatRequest(BaseModel):
-    message: str
-    history: Optional[List[ChatMessage]] = None
-    mode:    Optional[str] = "qa"
+    message:    str
+    history:    Optional[List[ChatMessage]] = None
+    mode:       Optional[str] = "qa"
+    # ── Approach B: base64 data URL sent when user attaches an image ──────────
+    # Fully backward-compatible — callers without image_data work as before.
+    image_data: Optional[str] = None
+
+# ── NEW: used by POST /chat/extract-file-text ─────────────────────────────────
+class FileExtractRequest(BaseModel):
+    type:     Literal["image", "pdf"]  # "image" → GPT-4o vision; "pdf" → pypdf
+    data:     str                       # base64 data URL  (data:<mime>;base64,<b64>)
+    filename: Optional[str] = ""
 
 class UploadResponse(BaseModel):
     success:    bool
@@ -2079,50 +2087,6 @@ def _safe_unlink(path: Optional[str]) -> None:
                 os.unlink(path)
         except Exception:
             pass
-
-
-# ============================================================
-# FILE-UPLOAD CHAT HELPERS
-# ============================================================
-
-def _is_file_upload_message(message: str) -> bool:
-    """Returns True if this chat message originated from a file upload."""
-    return bool(_FILE_UPLOAD_MARKER.match(message.strip()))
-
-
-def _extract_file_content(message: str) -> str:
-    """
-    Pull out only the text between the triple-quote delimiters.
-    Falls back to the full message if the pattern is not found.
-    """
-    m = re.search(r'"""\n(.*?)\n"""', message, re.DOTALL)
-    return m.group(1).strip() if m else message
-
-
-def _extract_student_question(message: str) -> str:
-    """
-    Pull out the student's typed question from a file-upload message.
-    Returns empty string if the student sent no additional text.
-    """
-    m = re.search(r"Student's question:\s*(.+)$", message, re.DOTALL)
-    return m.group(1).strip() if m else ""
-
-
-def _build_rag_query_from_file_message(message: str) -> str:
-    """
-    Build the best possible RAG search query from a file-upload message.
-    Priority: student's typed question → extracted file text (first 500 chars).
-    """
-    q = _extract_student_question(message)
-    if q:
-        return q
-    return _extract_file_content(message)[:500]
-
-
-def _file_type_label(message: str) -> str:
-    """Return 'Image' or 'Document' from the upload marker."""
-    m = _FILE_UPLOAD_MARKER.match(message.strip())
-    return m.group(1).capitalize() if m else "File"
 
 
 # ============================================================
@@ -2420,50 +2384,35 @@ def detect_subject(question: str) -> Optional[str]:
     return None
 
 
-async def is_cs_related_question(message: str) -> bool:
-    """
-    Classify whether a message is CS/ICSI-related.
-
-    For file-upload messages we extract the core content first so the
-    classifier doesn't get confused by the upload metadata wrapper.
-    """
-    # ── Strip file-upload wrapper before classifying ──────────────────────────
-    if _is_file_upload_message(message):
-        # Use student's explicit question if present, else the extracted text
-        core = _extract_student_question(message) or _extract_file_content(message)
-        classify_text = core[:1500]  # cap for LLM cost
-    else:
-        classify_text = message
-
-    # ── Fast keyword bypass (platform questions always allowed) ───────────────
+async def is_cs_related_question(question: str) -> bool:
     _platform_keywords = [
         "cs tutor", "this app", "this platform", "who made", "who built",
         "who created", "who started", "about this", "founder", "promoter",
         "tell me about", "what is this app",
     ]
-    if any(kw in classify_text.lower() for kw in _platform_keywords):
+    if any(kw in question.lower() for kw in _platform_keywords):
         return True
 
     system = (
         "You are a domain classifier for an Indian Company Secretary (CS) assistant.\n\n"
-        "Answer YES if the question or text relates to:\n"
+        "Answer YES if the question relates to:\n"
         "- ICSI syllabus, Company Law, Securities Law, Insolvency Law, FEMA,\n"
         "  Direct Tax, Indirect Tax/GST, Secretarial Practice, General Law,\n"
         "  Corporate Governance, CS exams (CSEET / Executive / Professional),\n"
         "  or basic commerce/legal concepts studied by CS students.\n"
         "- The CS Tutor app, its features, team, or anything about this platform.\n\n"
         "Answer NO only if it is clearly unrelated (pure science, coding, sports, "
-        "entertainment, personal chat, random images with no CS content).\n\n"
+        "entertainment, random images/files with no CS content).\n\n"
         "Respond with YES or NO only."
     )
     try:
         result = await call_llm([
             {"role": "system", "content": system},
-            {"role": "user",   "content": classify_text},
+            {"role": "user",   "content": question},
         ])
         return result.strip().upper().startswith("YES")
     except Exception:
-        return True  # fail-open
+        return True
 
 
 # ============================================================
@@ -2510,6 +2459,11 @@ async def _run_upload_pipeline(
     admin_email:               str,
     enable_image_descriptions: bool,
 ) -> None:
+    """
+    Runs as a FastAPI BackgroundTask — outside the 30-second Render HTTP window.
+    Writes PDF to /tmp, calls Docling + Pinecone, inserts Mongo records,
+    and updates _upload_jobs[job_id] throughout.
+    """
     temp_file_path: Optional[str] = None
 
     try:
@@ -2840,6 +2794,7 @@ async def upload_service_health():
             "background_upload":    True,
             "gemini_summarisation": bool(getattr(settings, "GEMINI_API_KEY", "")),
             "file_upload_chat":     True,
+            "vision_extraction":    True,
         },
     }
 
@@ -2956,6 +2911,112 @@ async def upload_smart_pdf(
 
 
 app.include_router(router)
+
+
+# ============================================================
+# FILE EXTRACTION ENDPOINT  (Approach B — server-side)
+# POST /chat/extract-file-text
+# Called by the frontend BEFORE /chat.
+# Returns { text: str } — the frontend sends this text inside req.message.
+# ============================================================
+
+@app.post("/chat/extract-file-text", tags=["Chat"])
+async def extract_file_text(
+    req:  FileExtractRequest,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Server-side file text extraction.
+
+    * type="image"  → GPT-4o vision; understands handwriting, diagrams, printed text.
+    * type="pdf"    → pypdf (already in project); up to 10 pages, capped at 4 000 chars.
+
+    Returns { text: str }.
+    The frontend embeds this text in the /chat message body so the
+    existing RAG + CS-gatekeeper pipeline handles it without changes.
+    """
+
+    # ── Strip data-URL header to get raw base64 ───────────────────────────────
+    raw_b64 = req.data
+    if "," in raw_b64:
+        raw_b64 = raw_b64.split(",", 1)[1]
+
+    # ── IMAGE: GPT-4o vision ──────────────────────────────────────────────────
+    if req.type == "image":
+        # Determine media type from data URL prefix (default jpeg)
+        mime = "image/jpeg"
+        if req.data.startswith("data:"):
+            mime = req.data.split(";")[0].split(":", 1)[1]
+
+        headers = {
+            "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+            "Content-Type":  "application/json",
+        }
+        payload = {
+            "model": VISION_MODEL,
+            "max_tokens": 1500,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extract ALL text visible in this image exactly as written. "
+                                "Preserve question numbers, section headings, options (a/b/c/d), "
+                                "and any marks or instructions. "
+                                "Output ONLY the extracted text — no commentary."
+                            ),
+                        },
+                        {
+                            "type":      "image_url",
+                            "image_url": {
+                                "url":    f"data:{mime};base64,{raw_b64}",
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(CHAT_URL, headers=headers, json=payload)
+                resp.raise_for_status()
+            extracted = resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"[vision] GPT-4o extraction failed: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Image text extraction failed: {str(e)}"
+            )
+
+        return {"text": extracted}
+
+    # ── PDF: pypdf ────────────────────────────────────────────────────────────
+    if req.type == "pdf":
+        try:
+            pdf_bytes = base64.b64decode(raw_b64)
+            reader    = PdfReader(io.BytesIO(pdf_bytes))
+            pages     = reader.pages[:10]           # cap at 10 pages
+            text      = "\n\n".join(
+                p.extract_text() or "" for p in pages
+            ).strip()
+            text = text[:4000]                      # cap chars to keep prompt lean
+            if not text:
+                text = f"[PDF file: {req.filename or 'document'} — no extractable text found]"
+        except Exception as e:
+            print(f"[pdf-extract] pypdf failed: {e}")
+            raise HTTPException(
+                status_code=422,
+                detail=f"PDF text extraction failed: {str(e)}"
+            )
+
+        return {"text": text}
+
+    # Should never reach here (Pydantic validates `type`)
+    raise HTTPException(status_code=400, detail="Unsupported file type.")
 
 
 # ============================================================
@@ -3389,62 +3450,105 @@ async def audio_proxy(url: str, user=Depends(get_current_user)):
 
 
 # ============================================================
-# CHAT  (RAG + CONVERSATION MEMORY + FILE-UPLOAD SUPPORT)
+# CHAT  (RAG + CONVERSATION MEMORY CHAINING)
 # ============================================================
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(req: ChatRequest, user=Depends(get_current_user)):
     try:
-        # ── Detect whether this message came from a file upload ───────────────
-        is_file_msg = _is_file_upload_message(req.message)
+        req.message = expand_cs_abbreviations(req.message)
 
-        # ── Abbreviation expansion (skip for file messages — they're already text)
-        if not is_file_msg:
-            req.message = expand_cs_abbreviations(req.message)
+        # ── Step 0b: Vision block (Approach B) ───────────────────────────────
+        # If the frontend sent image_data (base64 data URL), call GPT-4o vision
+        # to extract the text and prepend it to req.message before the gatekeeper.
+        # This means the CS gatekeeper validates the combined text automatically.
+        if req.image_data:
+            try:
+                mime    = "image/jpeg"
+                raw_b64 = req.image_data
+                if req.image_data.startswith("data:"):
+                    mime    = req.image_data.split(";")[0].split(":", 1)[1]
+                    raw_b64 = req.image_data.split(",", 1)[1]
 
-        # ── CS relevance check ────────────────────────────────────────────────
-        # is_cs_related_question now strips the upload wrapper internally,
-        # so we pass the raw message and let it handle both cases.
+                headers = {
+                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                    "Content-Type":  "application/json",
+                }
+                vision_payload = {
+                    "model": VISION_MODEL,
+                    "max_tokens": 1500,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Extract ALL text visible in this image exactly as written. "
+                                        "Preserve question numbers, section headings, options (a/b/c/d), "
+                                        "and any marks or instructions. "
+                                        "Output ONLY the extracted text — no commentary."
+                                    ),
+                                },
+                                {
+                                    "type":      "image_url",
+                                    "image_url": {
+                                        "url":    f"data:{mime};base64,{raw_b64}",
+                                        "detail": "high",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+                async with httpx.AsyncClient(timeout=60) as client:
+                    vision_resp = await client.post(CHAT_URL, headers=headers, json=vision_payload)
+                    vision_resp.raise_for_status()
+
+                image_text = vision_resp.json()["choices"][0]["message"]["content"].strip()
+
+                # Prepend extracted image text to the student's typed message
+                if image_text:
+                    prefix      = f"[Text extracted from uploaded image]\n{image_text}\n\n"
+                    req.message = prefix + req.message if req.message.strip() else prefix.strip()
+
+                print(f"[vision] Extracted {len(image_text)} chars from image")
+
+            except Exception as vision_err:
+                # Non-fatal — proceed with just the typed message
+                print(f"[vision] Image extraction failed (non-fatal): {vision_err}")
+
+        # ── CS gatekeeper ─────────────────────────────────────────────────────
         if not await is_cs_related_question(req.message):
-            not_cs_reply = (
-                "⚠️ The content in your uploaded file does not appear to be related to "
-                "CS (Company Secretary) / ICSI studies.\n\n"
-                "This assistant only answers questions on:\n"
-                "- Company Law, Securities Law, Insolvency & Bankruptcy Code\n"
-                "- FEMA, Direct Tax, Indirect Tax / GST\n"
-                "- Secretarial Practice, Corporate Governance\n"
-                "- CS exams (CSEET / Executive / Professional)\n\n"
-                "Please upload a file containing CS exam questions or study material."
-            ) if is_file_msg else (
-                "This assistant is designed for Indian CS (Company Secretary) students. "
-                "Please ask a question related to CS topics such as Company Law, Securities Law, "
-                "Insolvency & Bankruptcy Code, FEMA, Secretarial Practice, Direct Tax, GST, "
-                "CS exams (CSEET / Executive / Professional), "
-                "or about this platform."
-            )
-            return ChatResponse(answer=not_cs_reply, sources=[])
+            # Tailor the rejection message when a file was involved
+            if req.image_data:
+                rejection = (
+                    "⚠️ The content in your uploaded image does not appear to be related to "
+                    "CS (Company Secretary) / ICSI studies.\n\n"
+                    "This assistant only answers questions on:\n"
+                    "- Company Law, Securities Law, Insolvency & Bankruptcy Code\n"
+                    "- FEMA, Direct Tax, Indirect Tax / GST\n"
+                    "- Secretarial Practice, Corporate Governance\n"
+                    "- CS exams (CSEET / Executive / Professional)\n\n"
+                    "Please upload an image containing CS exam questions or study material."
+                )
+            else:
+                rejection = (
+                    "This assistant is designed for Indian CS (Company Secretary) students. "
+                    "Please ask a question related to CS topics such as Company Law, Securities Law, "
+                    "Insolvency & Bankruptcy Code, FEMA, Secretarial Practice, Direct Tax, GST, "
+                    "CS exams (CSEET / Executive / Professional), "
+                    "or about this platform."
+                )
+            return ChatResponse(answer=rejection, sources=[])
 
-        # ── Build the RAG search query ────────────────────────────────────────
-        # For file messages use extracted question / content, not the full wrapper.
-        if is_file_msg:
-            rag_query = _build_rag_query_from_file_message(req.message)
-            file_type = _file_type_label(req.message)
-            file_content = _extract_file_content(req.message)
-            student_q    = _extract_student_question(req.message)
-        else:
-            rag_query    = req.message
-            file_type    = ""
-            file_content = ""
-            student_q    = ""
-
-        # ── Memory ────────────────────────────────────────────────────────────
         memory       = await get_user_memory(user["email"])
         memory_block = build_memory_block(memory)
 
         query_embedding = await embed_single(
-            enrich_query_for_rag(rag_query)[:MAX_TEXT_LENGTH_FOR_EMBED]
+            enrich_query_for_rag(req.message)[:MAX_TEXT_LENGTH_FOR_EMBED]
         )
-        detected_subj = detect_subject(rag_query)
+        detected_subj   = detect_subject(req.message)
 
         q_kwargs: Dict[str, Any] = {
             "vector":           query_embedding,
@@ -3477,31 +3581,17 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
             matches = res.get("matches") or []
 
         matches = sorted(matches, key=lambda m: m.get("score", 0), reverse=True)
-        q_len   = len(rag_query.split())
+        q_len   = len(req.message.split())
         thr     = 0.35 if q_len <= 6 else 0.45 if q_len <= 15 else 0.52
         matches = [m for m in matches if m.get("score", 0) >= thr] or matches[:5]
 
         personal_context = build_personalized_layer(user)
 
-        # ── File-upload extra block injected into every system prompt ─────────
-        file_context_block = ""
-        if is_file_msg:
-            file_context_block = (
-                f"\n\n=== {file_type.upper()} UPLOADED BY STUDENT ===\n"
-                f"{file_content[:6000]}\n"
-                f"=== END OF {file_type.upper()} CONTENT ===\n\n"
-                + (f"Student's specific question: {student_q}\n\n" if student_q else
-                   "The student has not typed an additional question — "
-                   "analyse the uploaded content and answer all CS questions found in it.\n\n")
-            )
-
-        # ── No RAG matches ────────────────────────────────────────────────────
         if not matches:
             system_prompt = (
                 memory_block
                 + personal_context + "\n\n"
-                + file_context_block
-                + "You are a senior Indian Company Secretary (CS) faculty with deep expertise "
+                "You are a senior Indian Company Secretary (CS) faculty with deep expertise "
                 "in ICSI exam preparation (CSEET, Executive, Professional).\n\n"
 
                 "Language rule (MANDATORY):\n"
@@ -3532,13 +3622,9 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                 "- Do not repeat what the student already knows well per the summary."
             )
 
-            llm_user_msg = student_q if (is_file_msg and student_q) else (
-                rag_query if is_file_msg else req.message
-            )
-
             answer = await call_llm([
                 {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": llm_user_msg},
+                {"role": "user",   "content": req.message},
             ])
 
             asyncio.create_task(
@@ -3553,7 +3639,6 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                 }],
             )
 
-        # ── Build RAG context ─────────────────────────────────────────────────
         context_blocks: List[str] = []
         sources: List[dict]       = []
 
@@ -3587,13 +3672,11 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
             total += len(b)
         context_str = "\n\n---\n\n".join(trimmed)
 
-        # ── System prompts (discussion / QA) ──────────────────────────────────
         if req.mode == "discussion":
             sys_p = (
                 memory_block
                 + personal_context + "\n\n"
-                + file_context_block
-                + "You are an expert Indian CS (Company Secretary) tutor simulating a healthy "
+                "You are an expert Indian CS (Company Secretary) tutor simulating a healthy "
                 "academic discussion between two CS students preparing for ICSI exams.\n\n"
 
                 "Language rules:\n"
@@ -3624,8 +3707,7 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
             sys_p = (
                 memory_block
                 + personal_context + "\n\n"
-                + file_context_block
-                + "You are an expert Indian Company Secretary (CS) tutor preparing students "
+                "You are an expert Indian Company Secretary (CS) tutor preparing students "
                 "for ICSI exams (CSEET, Executive, Professional).\n\n"
 
                 "Language rule:\n"
@@ -3654,13 +3736,8 @@ async def chat(req: ChatRequest, user=Depends(get_current_user)):
                 f"Context:\n{context_str}"
             )
 
-        # ── The user turn sent to the LLM ─────────────────────────────────────
-        llm_user_msg = student_q if (is_file_msg and student_q) else (
-            rag_query if is_file_msg else req.message
-        )
-
         answer = await call_llm_with_chain(
-            user_question       = llm_user_msg,
+            user_question       = req.message,
             context             = context_str,
             final_system_prompt = sys_p,
         )
