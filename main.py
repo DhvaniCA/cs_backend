@@ -2064,6 +2064,8 @@ app.add_middleware(
     expose_headers     = ["*"],
 )
 
+print("FRONTEND_ORIGIN =", settings.FRONTEND_ORIGIN)
+print("ALLOW_ORIGINS =", _allow_origins)
 app.include_router(payment_router, prefix="/payments", tags=["payments"])
 
 CHAT_URL  = "https://api.openai.com/v1/chat/completions"
